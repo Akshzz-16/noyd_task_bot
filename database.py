@@ -1,24 +1,25 @@
-import sqlite3
+import os
+from dotenv import load_dotenv
+import psycopg2
 
-conn = sqlite3.connect("noyd_tasks.db")
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT,
-    assigned_to INTEGER,
-    created_by INTEGER,
+    id SERIAL PRIMARY KEY,
+    title TEXT NOT NULL,
+    assigned_to BIGINT,
+    created_by BIGINT,
     status TEXT,
-    created_at TEXT,
-    completed_at TEXT
+    created_at TIMESTAMP,
+    completed_at TIMESTAMP
 )
 """)
 
 conn.commit()
 conn.close()
-
-print("✅ Database initialized")
-
-
-
+print("✅ tasks table created")

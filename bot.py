@@ -2,34 +2,45 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from discord.ui import View, Button, Select
-import sqlite3
 from datetime import datetime
-from config import TOKEN
+import psycopg2
+import os
+from dotenv import load_dotenv
 
-# ================= DATABASE =================
-conn = sqlite3.connect("noyd_tasks.db")
-cursor = conn.cursor()
+# ================= ENV =================
+load_dotenv()
 
-# --- USER ROLES TABLE ---
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS user_roles (
-    user_id INTEGER PRIMARY KEY,
-    role TEXT
-)
-""")
-conn.commit()
+TOKEN = os.getenv("TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ================= DB HELPER =================
+def get_db():
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    return conn, cursor
 
 # ================= ROLE HELPERS =================
 def get_user_role(user_id: int) -> str:
+    conn, cursor = get_db()
     cursor.execute(
-        "SELECT role FROM user_roles WHERE user_id=?",
+        "SELECT role FROM user_roles WHERE user_id=%s",
         (user_id,)
     )
     row = cursor.fetchone()
+    conn.close()
     return row[0] if row else "user"
 
 def is_admin(user_id: int) -> bool:
     return get_user_role(user_id) in ("admin", "superuser")
+
+def log_admin_action(admin_id: int, action: str, target: str):
+    conn, cursor = get_db()
+    cursor.execute(
+        "INSERT INTO admin_logs (admin_id, action, target, timestamp) VALUES (%s, %s, %s, %s)",
+        (admin_id, action, target, datetime.now())
+    )
+    conn.commit()
+    conn.close()
 
 # ================= BOT SETUP =================
 intents = discord.Intents.default()
@@ -47,14 +58,16 @@ bot = NOYDBot()
 
 @bot.event
 async def on_ready():
-    # 🔒 SET SUPERUSER ONCE
-    SUPERUSER_ID = 755988808993996830  # 🔴 PUT YOUR DISCORD USER ID HERE
+    SUPERUSER_ID = 123456789012345678  # 🔴 PUT YOUR DISCORD USER ID
 
+    conn, cursor = get_db()
     cursor.execute(
-        "INSERT OR IGNORE INTO user_roles (user_id, role) VALUES (?, ?)",
+        "INSERT INTO user_roles (user_id, role) VALUES (%s, %s) "
+        "ON CONFLICT (user_id) DO NOTHING",
         (SUPERUSER_ID, "superuser")
     )
     conn.commit()
+    conn.close()
 
     print(f"🚀 NOYD Task Bot online as {bot.user}")
 
@@ -80,11 +93,13 @@ class StartButton(Button):
 
         new_status = "in_progress" if self.status != "in_progress" else "todo"
 
+        conn, cursor = get_db()
         cursor.execute(
-            "UPDATE tasks SET status=? WHERE id=?",
+            "UPDATE tasks SET status=%s WHERE id=%s",
             (new_status, self.task_id)
         )
         conn.commit()
+        conn.close()
 
         await interaction.response.send_message(
             f"🔄 Task #{self.task_id} → **{new_status.upper()}**",
@@ -105,15 +120,13 @@ class DoneButton(Button):
 
         new_status = "done" if self.status != "done" else "todo"
 
+        conn, cursor = get_db()
         cursor.execute(
-            "UPDATE tasks SET status=?, completed_at=? WHERE id=?",
-            (
-                new_status,
-                datetime.now().isoformat() if new_status == "done" else None,
-                self.task_id
-            )
+            "UPDATE tasks SET status=%s, completed_at=%s WHERE id=%s",
+            (new_status, datetime.now() if new_status == "done" else None, self.task_id)
         )
         conn.commit()
+        conn.close()
 
         await interaction.response.send_message(
             f"🎉 Task #{self.task_id} → **{new_status.upper()}**",
@@ -133,8 +146,6 @@ class TaskSelect(Select):
 
         super().__init__(
             placeholder="Select a task to manage",
-            min_values=1,
-            max_values=1,
             options=options
         )
         self.user_id = user_id
@@ -146,11 +157,10 @@ class TaskSelect(Select):
 
         task_id = int(self.values[0])
 
-        cursor.execute(
-            "SELECT status FROM tasks WHERE id=?",
-            (task_id,)
-        )
+        conn, cursor = get_db()
+        cursor.execute("SELECT status FROM tasks WHERE id=%s", (task_id,))
         status = cursor.fetchone()[0]
+        conn.close()
 
         await interaction.response.send_message(
             f"🛠️ Manage Task #{task_id}",
@@ -163,7 +173,7 @@ class TaskSelectView(View):
         super().__init__(timeout=120)
         self.add_item(TaskSelect(tasks, user_id))
 
-# ================= SLASH COMMANDS =================
+# ================= COMMANDS =================
 
 @bot.tree.command(name="task_create", description="Create a new task")
 @app_commands.describe(title="Task title", member="Assign task to user")
@@ -172,11 +182,14 @@ async def task_create(interaction: discord.Interaction, title: str, member: disc
         await interaction.response.send_message("⛔ Admin access required.", ephemeral=True)
         return
 
+    conn, cursor = get_db()
     cursor.execute(
-        "INSERT INTO tasks (title, assigned_to, created_by, status, created_at) VALUES (?, ?, ?, ?, ?)",
-        (title, member.id, interaction.user.id, "todo", datetime.now().isoformat())
+        "INSERT INTO tasks (title, assigned_to, created_by, status, created_at) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (title, member.id, interaction.user.id, "todo", datetime.now())
     )
     conn.commit()
+    conn.close()
 
     await interaction.response.send_message(
         f"📝 Task **{title}** assigned to {member.mention}"
@@ -184,11 +197,13 @@ async def task_create(interaction: discord.Interaction, title: str, member: disc
 
 @bot.tree.command(name="my_tasks", description="View and manage your tasks")
 async def my_tasks(interaction: discord.Interaction):
+    conn, cursor = get_db()
     cursor.execute(
-        "SELECT id, title, status FROM tasks WHERE assigned_to=?",
+        "SELECT id, title, status FROM tasks WHERE assigned_to=%s",
         (interaction.user.id,)
     )
     tasks = cursor.fetchall()
+    conn.close()
 
     if not tasks:
         await interaction.response.send_message("📭 You have no tasks.")
@@ -212,165 +227,169 @@ async def my_tasks(interaction: discord.Interaction):
         view=TaskSelectView(tasks, interaction.user.id)
     )
 
-# ================= ADMIN ROLE COMMANDS =================
+@bot.tree.command(name="task_delete", description="Delete a task (ADMIN ONLY)")
+@app_commands.describe(task_id="Task ID", confirm="Type DELETE to confirm")
+async def task_delete(interaction: discord.Interaction, task_id: int, confirm: str):
+    await interaction.response.defer(ephemeral=True)
 
-@bot.tree.command(name="grant_admin", description="Grant admin rights")
-@app_commands.describe(member="User to promote")
+    if not is_admin(interaction.user.id):
+        await interaction.followup.send("⛔ Admin access required.")
+        return
+
+    if confirm != "DELETE":
+        await interaction.followup.send("❌ Type DELETE exactly to confirm.")
+        return
+
+    conn, cursor = get_db()
+    cursor.execute("SELECT title FROM tasks WHERE id=%s", (task_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        conn.close()
+        await interaction.followup.send("❌ Task not found.")
+        return
+
+    cursor.execute("DELETE FROM tasks WHERE id=%s", (task_id,))
+    conn.commit()
+    conn.close()
+
+    log_admin_action(interaction.user.id, "DELETE_TASK", f"Task #{task_id}")
+
+    await interaction.followup.send(f"🗑️ Task #{task_id} deleted.")
+
+# ================= ROLE / INFO COMMANDS =================
+
+@bot.tree.command(name="grant_admin", description="Grant admin rights (SUPERUSER ONLY)")
+@app_commands.describe(member="User to grant admin rights")
 async def grant_admin(interaction: discord.Interaction, member: discord.Member):
     if get_user_role(interaction.user.id) != "superuser":
         await interaction.response.send_message("⛔ Only superuser can grant admin.", ephemeral=True)
         return
 
+    conn, cursor = get_db()
     cursor.execute(
-        "INSERT OR REPLACE INTO user_roles (user_id, role) VALUES (?, ?)",
+        "INSERT INTO user_roles (user_id, role) VALUES (%s, %s) "
+        "ON CONFLICT (user_id) DO UPDATE SET role='admin'",
         (member.id, "admin")
     )
     conn.commit()
+    conn.close()
 
+    log_admin_action(interaction.user.id, "GRANT_ADMIN", member.name)
     await interaction.response.send_message(f"✅ {member.mention} is now an **ADMIN**")
 
-@bot.tree.command(name="revoke_admin", description="Revoke admin rights")
-@app_commands.describe(member="Admin to demote")
+@bot.tree.command(name="revoke_admin", description="Revoke admin rights (SUPERUSER ONLY)")
+@app_commands.describe(member="Admin to revoke")
 async def revoke_admin(interaction: discord.Interaction, member: discord.Member):
     if get_user_role(interaction.user.id) != "superuser":
         await interaction.response.send_message("⛔ Only superuser can revoke admin.", ephemeral=True)
         return
 
+    conn, cursor = get_db()
     cursor.execute(
-        "DELETE FROM user_roles WHERE user_id=? AND role='admin'",
+        "DELETE FROM user_roles WHERE user_id=%s AND role='admin'",
         (member.id,)
     )
     conn.commit()
+    conn.close()
 
+    log_admin_action(interaction.user.id, "REVOKE_ADMIN", member.name)
     await interaction.response.send_message(f"🔻 {member.mention} is no longer an admin")
 
+@bot.tree.command(name="myrole", description="Show your role")
+async def myrole(interaction: discord.Interaction):
+    role = get_user_role(interaction.user.id)
 
-@bot.tree.command(name="task_delete", description="Delete a task (ADMIN ONLY)")
-@app_commands.describe(
-    task_id="ID of the task to delete",
-    confirm="Type DELETE to confirm"
-)
-async def task_delete(
-    interaction: discord.Interaction,
-    task_id: int,
-    confirm: str
-):
-    # ✅ Immediately acknowledge (prevents timeout)
-    await interaction.response.defer(ephemeral=True)
+    embed = discord.Embed(
+        title="🔐 Your Role",
+        description=f"You are **{role.upper()}**",
+        color=discord.Color.green()
+    )
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
 
-    try:
-        # ---- PERMISSION CHECK ----
-        if not is_admin(interaction.user.id):
-            await interaction.followup.send(
-                "⛔ Admin access required."
-            )
-            return
-
-        # ---- CONFIRMATION CHECK ----
-        if confirm != "DELETE":
-            await interaction.followup.send(
-                "❌ Deletion aborted. You must type `DELETE` exactly."
-            )
-            return
-
-        # ---- TASK EXISTS CHECK ----
-        cursor.execute(
-            "SELECT title FROM tasks WHERE id=?",
-            (task_id,)
-        )
-        task = cursor.fetchone()
-
-        if not task:
-            await interaction.followup.send(
-                "❌ Task not found."
-            )
-            return
-
-        task_title = task[0]
-
-        # ---- DELETE TASK ----
-        cursor.execute(
-            "DELETE FROM tasks WHERE id=?",
-            (task_id,)
-        )
-        conn.commit()
-
-        await interaction.followup.send(
-            f"🗑️ Task #{task_id} (**{task_title}**) deleted successfully."
-        )
-
-    except Exception as e:
-        # 🔴 If anything goes wrong, we still respond
-        await interaction.followup.send(
-            f"⚠️ Error occurred: `{e}`"
-        )
-        print("DELETE ERROR:", e)
-
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="whoissuper", description="Show the superuser")
 async def whoissuper(interaction: discord.Interaction):
-    cursor.execute(
-        "SELECT user_id FROM user_roles WHERE role='superuser'"
-    )
+    conn, cursor = get_db()
+    cursor.execute("SELECT user_id FROM user_roles WHERE role='superuser'")
     row = cursor.fetchone()
+    conn.close()
 
     if not row:
         await interaction.response.send_message("❌ No superuser found.")
         return
 
-    user_id = row[0]
-    user = await bot.fetch_user(user_id)
+    user = await bot.fetch_user(row[0])
 
     embed = discord.Embed(
         title="👑 Superuser",
-        description=f"**{user.name}#{user.discriminator}**",
+        description=user.name,
         color=discord.Color.gold()
     )
     embed.set_thumbnail(url=user.display_avatar.url)
 
     await interaction.response.send_message(embed=embed)
 
-
-@bot.tree.command(name="whoisadmin", description="Show current admins")
+@bot.tree.command(name="whoisadmin", description="Show admins")
 async def whoisadmin(interaction: discord.Interaction):
-    cursor.execute(
-        "SELECT user_id FROM user_roles WHERE role='admin'"
-    )
+    conn, cursor = get_db()
+    cursor.execute("SELECT user_id FROM user_roles WHERE role='admin'")
     rows = cursor.fetchall()
+    conn.close()
 
     if not rows:
-        await interaction.response.send_message("ℹ️ No admins assigned.")
+        await interaction.response.send_message("ℹ️ No admins.")
         return
 
-    admin_ids = [row[0] for row in rows]
-    admins = [await bot.fetch_user(uid) for uid in admin_ids]
+    admins = [await bot.fetch_user(r[0]) for r in rows]
 
-    # 🔹 If only ONE admin → show avatar
     if len(admins) == 1:
         admin = admins[0]
         embed = discord.Embed(
             title="🛡️ Admin",
-            description=f"**{admin.name}#{admin.discriminator}**",
+            description=admin.name,
             color=discord.Color.blue()
         )
         embed.set_thumbnail(url=admin.display_avatar.url)
-
-        await interaction.response.send_message(embed=embed)
-
-    # 🔹 Multiple admins → list usernames
     else:
-        names = "\n".join(
-            f"• {admin.name}#{admin.discriminator}"
-            for admin in admins
-        )
-
         embed = discord.Embed(
             title="🛡️ Admins",
-            description=names,
+            description="\n".join(f"• {a.name}" for a in admins),
             color=discord.Color.blue()
         )
 
-        await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
-# ================= RUN BOT =================
+@bot.tree.command(name="admin_logs", description="View admin logs")
+async def admin_logs(interaction: discord.Interaction):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("⛔ Admin access required.", ephemeral=True)
+        return
+
+    conn, cursor = get_db()
+    cursor.execute(
+        "SELECT admin_id, action, target, timestamp FROM admin_logs ORDER BY id DESC LIMIT 10"
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message("ℹ️ No logs found.")
+        return
+
+    text = ""
+    for admin_id, action, target, ts in rows:
+        admin = await bot.fetch_user(admin_id)
+        text += f"• **{admin.name}** → `{action}` → {target}\n"
+
+    embed = discord.Embed(
+        title="📜 Admin Logs",
+        description=text,
+        color=discord.Color.orange()
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+# ================= RUN =================
 bot.run(TOKEN)
